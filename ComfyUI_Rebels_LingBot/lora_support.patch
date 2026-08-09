@@ -1,0 +1,421 @@
+diff --git a/ComfyUI_Rebels_LingBot/lingbot_nodes.py b/ComfyUI_Rebels_LingBot/lingbot_nodes.py
+index 8ec449f..63efdcf 100644
+--- a/ComfyUI_Rebels_LingBot/lingbot_nodes.py
++++ b/ComfyUI_Rebels_LingBot/lingbot_nodes.py
+@@ -19,6 +19,7 @@ Memory profile on an 8GB card:
+ 
+ import gc
+ import os
++import re
+ import sys
+ 
+ import torch
+@@ -118,6 +119,147 @@ def _free(*objs):
+         torch.cuda.empty_cache()
+ 
+ 
++def _lora_files():
++    try:
++        files = folder_paths.get_filename_list("loras")
++    except Exception:
++        files = []
++    return sorted(f for f in files if f.endswith(".safetensors")) or ["none found"]
++
++
++# ---------------------------------------------------------------------------
++# LoRA support (dense 1.3B transformer only - plain nn.Linear weights).
++#
++# Merges LoRA deltas straight into the transformer's Linear.weight tensors
++# (they live on CPU at this point - the loader never .to(device)s the DiT,
++# the sampler does that per-run - so this is RAM, not VRAM, and cheap to
++# back up/restore).
++#
++# Accepts two common on-disk layouts:
++#   PEFT/diffusers : <module>.lora_A.weight / <module>.lora_B.weight [+ .alpha]
++#   Kohya-style     : lora_unet_<module_with_underscores>.lora_down.weight /
++#                      .lora_up.weight [+ .alpha]
++# Common prefixes (base_model.model., diffusion_model., transformer.,
++# model.diffusion_model., lora_unet_) are stripped so keys line up with this
++# repo's own module names (blocks.N.attn.to_q, blocks.N.ffn.gate_proj, ...).
++#
++# Deltas (not full-weight snapshots) are kept per (transformer id, node's
++# UNIQUE_ID), keyed by module name, so re-running the same LoRA node (new
++# strength/file) only subtracts its OWN previously-added delta before adding
++# the new one. Because addition is commutative this stays correct no matter
++# what order upstream/downstream LingBotLoraLoader nodes re-execute in - a
++# stale "snapshot the weight before I touched it" backup would NOT be (it
++# would clobber whatever a later-chained LoRA node added in the meantime).
++# ---------------------------------------------------------------------------
++_LORA_BACKUPS = {}  # (id(transformer), node_unique_id) -> {module_name: delta tensor}
++_LORA_PREFIXES = ("base_model.model.", "model.diffusion_model.", "diffusion_model.", "transformer.")
++
++
++def _group_lora_tensors(state_dict):
++    """Groups by the raw key prefix (before any diffusion_model./lora_unet_
++    normalization) - resolving that prefix to an actual module name needs
++    the transformer's own module list, so it happens in the caller."""
++    groups = {}
++    for k, v in state_dict.items():
++        base, kind = None, None
++        for suf, knd in ((".lora_A.weight", "A"), (".lora_B.weight", "B"),
++                         (".lora_down.weight", "down"), (".lora_up.weight", "up"),
++                         (".alpha", "alpha")):
++            if k.endswith(suf):
++                base, kind = k[:-len(suf)], knd
++                break
++        if base is None:
++            continue
++        groups.setdefault(base, {})[kind] = v
++    return groups
++
++
++def _resolve_lora_module_name(base, modules, flat_lookup):
++    """Maps a raw LoRA key prefix to a real dotted module name.
++
++    Handles the PEFT/diffusers case (already dotted, just needs a known
++    prefix stripped) and the Kohya case (fully underscored, e.g.
++    'lora_unet_blocks_0_attn_to_q'). A blind '_' -> '.' replace breaks
++    module names that themselves contain underscores (to_q, gate_proj), so
++    Kohya keys are resolved by looking up the underscored form of every
++    real Linear module name instead of guessing where the dots go.
++    """
++    b = base
++    for pre in _LORA_PREFIXES:
++        if b.startswith(pre):
++            b = b[len(pre):]
++            break
++    if b in modules:
++        return b
++    if b.startswith("lora_unet_"):
++        b = b[len("lora_unet_"):]
++    return flat_lookup.get(b)
++
++
++def _apply_lora_to_transformer(transformer, lora_path, strength, backup_key):
++    from safetensors.torch import load_file
++
++    # undo THIS node's own previous application (if any) before reapplying,
++    # so repeated runs with a new strength/file never stack on themselves
++    prev = _LORA_BACKUPS.pop(backup_key, None)
++    if prev:
++        modules = dict(transformer.named_modules())
++        for base, old_delta in prev.items():
++            mod = modules.get(base)
++            if mod is not None and hasattr(mod, "weight"):
++                mod.weight.data.sub_(old_delta.to(mod.weight.dtype))
++
++    if strength == 0:
++        return 0, 0
++
++    sd = load_file(lora_path)
++    groups = _group_lora_tensors(sd)
++    modules = dict(transformer.named_modules())
++    flat_lookup = {
++        name.replace(".", "_"): name for name, m in modules.items()
++        if isinstance(getattr(m, "weight", None), torch.nn.Parameter)
++    }
++    backup = {}
++    applied, skipped = 0, 0
++
++    for raw_base, g in groups.items():
++        down = g.get("A", g.get("down"))
++        up = g.get("B", g.get("up"))
++        if down is None or up is None:
++            skipped += 1
++            continue
++        base = _resolve_lora_module_name(raw_base, modules, flat_lookup)
++        target = modules.get(base) if base else None
++        if target is None or not isinstance(getattr(target, "weight", None), torch.nn.Parameter):
++            skipped += 1
++            continue
++        weight = target.weight
++        if weight.dim() != 2:
++            skipped += 1
++            continue
++
++        rank = down.shape[0]
++        alpha = g.get("alpha")
++        scale = (float(alpha) / rank if alpha is not None else 1.0) * strength
++
++        delta = (up.to(torch.float32) @ down.to(torch.float32)) * scale
++        if delta.shape != weight.shape:
++            print("[LingBot] LoRA shape mismatch on {}: delta {} vs weight {} - skipped".format(
++                base, tuple(delta.shape), tuple(weight.shape)))
++            skipped += 1
++            continue
++
++        delta = delta.to(weight.dtype)
++        weight.data.add_(delta)
++        backup[base] = delta.detach().clone()
++        applied += 1
++
++    del sd
++    if backup:
++        _LORA_BACKUPS[backup_key] = backup
++    return applied, skipped
++
++
+ # ---------------------------------------------------------------------------
+ # 1) Lazy text encoder node
+ # ---------------------------------------------------------------------------
+@@ -374,6 +516,55 @@ class LingBotLoader:
+                  "device": device, "dtype": torch_dtype},)
+ 
+ 
++# ---------------------------------------------------------------------------
++# 2b) LoRA loader - drop between LingBotLoader and LingBotSampler.
++# Chain several of these to stack multiple LoRAs.
++# ---------------------------------------------------------------------------
++class LingBotLoraLoader:
++    @classmethod
++    def INPUT_TYPES(s):
++        return {
++            "required": {
++                "lingbot_model": ("LINGBOT_MODEL",),
++                "lora_name": (_lora_files(),),
++                "strength": ("FLOAT", {"default": 1.0, "min": -5.0, "max": 5.0, "step": 0.01}),
++            },
++            "hidden": {"unique_id": "UNIQUE_ID"},
++        }
++
++    RETURN_TYPES = ("LINGBOT_MODEL",)
++    FUNCTION = "load"
++    CATEGORY = "Rebels/LingBot"
++
++    def load(self, lingbot_model, lora_name, strength, unique_id=None):
++        transformer = lingbot_model["transformer"]
++        if lora_name == "none found":
++            raise FileNotFoundError(
++                "No .safetensors files in ComfyUI/models/loras")
++        lora_path = folder_paths.get_full_path("loras", lora_name)
++        if not lora_path:
++            raise FileNotFoundError("lora file not found: {}".format(lora_name))
++
++        backup_key = (id(transformer), unique_id or lora_name)
++        # GGUF (30B MoE) transformers hold quantized weights (_GGUFLinear30 /
++        # _GGUFExpertStack) with no persistent float tensor to merge into, so
++        # they need the forward-time-delta path instead of the dense 1.3B's
++        # direct weight merge.
++        is_gguf = any(type(m).__name__ == "_GGUFLinear30" for m in transformer.modules())
++        if is_gguf:
++            applied, skipped = _apply_lora_to_gguf_transformer(
++                transformer, lora_path, strength, backup_key)
++        else:
++            applied, skipped = _apply_lora_to_transformer(
++                transformer, lora_path, strength, backup_key)
++        print("[LingBot] LoRA '{}' strength={} ({}): {} tensors matched, {} skipped".format(
++            lora_name, strength, "30B GGUF" if is_gguf else "1.3B dense", applied, skipped))
++        if applied == 0 and strength != 0:
++            print("[LingBot] WARNING: no LoRA weights matched the transformer's module "
++                  "names - check the LoRA was trained for this architecture")
++        return (lingbot_model,)
++
++
+ # ---------------------------------------------------------------------------
+ # 3) Sampler node
+ # ---------------------------------------------------------------------------
+@@ -767,6 +958,13 @@ class _GGUFLinear30(torch.nn.Module):
+         object.__setattr__(self, "qdata", qdata)
+         self.qtype = qtype
+         self.oshape = tuple(int(x) for x in oshape)
++        # LoRA support: contributions keyed by the applying node's identity
++        # (see LingBotLoraLoader) so a node can undo/replace only its own
++        # delta; _rebels_lora_delta is the pre-summed cache actually used in
++        # forward(). Neither is a Parameter/buffer - plain attrs, moved to
++        # the compute device lazily like qdata.
++        object.__setattr__(self, "_rebels_lora_contribs", {})
++        object.__setattr__(self, "_rebels_lora_delta", None)
+         # register_buffer BEFORE any plain self.bias assignment - assigning
+         # self.bias=None first makes it a plain attr and register_buffer then
+         # errors "attribute 'bias' already exists".
+@@ -778,6 +976,12 @@ class _GGUFLinear30(torch.nn.Module):
+     def forward(self, x):
+         q = self.qdata.to(x.device, non_blocking=True) if self.qdata.device != x.device else self.qdata
+         w = _dequant30(q, self.qtype, self.oshape, x.dtype)
++        ld = self._rebels_lora_delta
++        if ld is not None:
++            if ld.device != w.device:
++                ld = ld.to(w.device)
++                object.__setattr__(self, "_rebels_lora_delta", ld)
++            w = w + ld.to(w.dtype)
+         out = torch.nn.functional.linear(x, w, self.bias.to(x.device, x.dtype) if self.bias is not None else None)
+         del w
+         return out
+@@ -801,14 +1005,159 @@ class _GGUFExpertStack:
+         self._e = per_expert  # list of (qdata_cpu, qtype, oshape2d), ordered by expert idx
+         self.device = device
+         self.dtype = dtype
++        # LoRA support, per routed expert: {expert_idx: {node_key: delta}}
++        # and the pre-summed cache {expert_idx: delta} actually applied.
++        self._rebels_lora_contribs = {}
++        self._rebels_lora_delta = {}
+ 
+     def __len__(self):
+         return len(self._e)
+ 
+     def __getitem__(self, idx):
+-        q, t, sh = self._e[int(idx)]
++        idx = int(idx)
++        q, t, sh = self._e[idx]
+         q = q.to(self.device, non_blocking=True) if q.device != self.device else q
+-        return _dequant30(q, t, sh, self.dtype)
++        w = _dequant30(q, t, sh, self.dtype)
++        ld = self._rebels_lora_delta.get(idx)
++        if ld is not None:
++            if ld.device != w.device:
++                ld = ld.to(w.device)
++                self._rebels_lora_delta[idx] = ld
++            w = w + ld.to(w.dtype)
++        return w
++
++
++# ---------------------------------------------------------------------------
++# LoRA support for the 30B MoE (GGUF) loader.
++#
++# Weights here are quantized bytes dequantized on demand (_GGUFLinear30,
++# _GGUFExpertStack) - there is no persistent float tensor to merge a delta
++# into. Instead each wrapper carries a small extra "_rebels_lora_delta" that
++# gets added to the dequantized weight at forward time (see their forward/
++# __getitem__ above). Contributions are tracked per applying-node key so
++# LingBotLoraLoader stays idempotent and stackable exactly like the dense
++# 1.3B path: recomputing a fresh SUM from a {node_key: delta} dict on every
++# apply, rather than mutating a running total in place, means node A
++# re-running with a new strength can never clobber node B's separately
++# tracked contribution, regardless of execution order.
++#
++# Routed-expert LoRA keys are matched via the same 'w1/w2/w3.<idx>' naming
++# the GGUF loader itself expects (see the exp_re regex in LingBotMoELoaderGGUF).
++# Most LoRAs (esp. step-distill ones) only touch attention + shared-expert
++# FFN, which map onto plain _GGUFLinear30 modules; per-routed-expert LoRA
++# keys are supported best-effort if present.
++# ---------------------------------------------------------------------------
++_EXPERT_IDX_RE = re.compile(r"^(.*)\.(w[123])\.(\d+)$")
++
++
++def _gguf_lora_target(base, modules):
++    """Resolve a normalized LoRA base name to a patchable target: either a
++    _GGUFLinear30 module, or (stack, expert_idx) for a routed-expert weight."""
++    m = modules.get(base)
++    if isinstance(m, _GGUFLinear30):
++        return ("linear", m)
++    em = _EXPERT_IDX_RE.match(base)
++    if em:
++        parent = modules.get(em.group(1))
++        stack = getattr(parent, em.group(2), None) if parent is not None else None
++        if isinstance(stack, _GGUFExpertStack):
++            return ("expert", stack, int(em.group(3)))
++    return None
++
++
++def _recompute_lora_sum(contribs):
++    if not contribs:
++        return None
++    it = iter(contribs.values())
++    total = next(it).clone()
++    for d in it:
++        total = total + d
++    return total
++
++
++def _apply_lora_to_gguf_transformer(transformer, lora_path, strength, backup_key):
++    from safetensors.torch import load_file
++
++    modules = dict(transformer.named_modules())
++
++    # undo THIS node's own previous contribution everywhere before reapplying
++    touched_linears, touched_stacks = set(), set()
++    for m in modules.values():
++        if isinstance(m, _GGUFLinear30) and backup_key in m._rebels_lora_contribs:
++            del m._rebels_lora_contribs[backup_key]
++            touched_linears.add(m)
++        for wname in ("w1", "w2", "w3"):
++            stack = getattr(m, wname, None)
++            if isinstance(stack, _GGUFExpertStack):
++                for contribs in stack._rebels_lora_contribs.values():
++                    if backup_key in contribs:
++                        del contribs[backup_key]
++                        touched_stacks.add(stack)
++
++    applied, skipped = 0, 0
++    if strength != 0:
++        sd = load_file(lora_path)
++        groups = _group_lora_tensors(sd)
++        flat_lookup = {
++            name.replace(".", "_"): name for name, m in modules.items()
++            if isinstance(m, _GGUFLinear30)
++        }
++        for raw_base, g in groups.items():
++            down = g.get("A", g.get("down"))
++            up = g.get("B", g.get("up"))
++            if down is None or up is None:
++                skipped += 1
++                continue
++            base = _resolve_lora_module_name(raw_base, modules, flat_lookup)
++            if base is None:
++                base = raw_base
++                for pre in _LORA_PREFIXES:
++                    if base.startswith(pre):
++                        base = base[len(pre):]
++                        break
++                if base.startswith("lora_unet_"):
++                    base = base[len("lora_unet_"):]
++            target = _gguf_lora_target(base, modules)
++            if target is None:
++                skipped += 1
++                continue
++
++            rank = down.shape[0]
++            alpha = g.get("alpha")
++            scale = (float(alpha) / rank if alpha is not None else 1.0) * strength
++            delta = (up.to(torch.float32) @ down.to(torch.float32)) * scale
++
++            if target[0] == "linear":
++                lin = target[1]
++                if tuple(delta.shape) != lin.oshape:
++                    print("[LingBot30B] LoRA shape mismatch on {}: delta {} vs {} - skipped".format(
++                        base, tuple(delta.shape), lin.oshape))
++                    skipped += 1
++                    continue
++                lin._rebels_lora_contribs[backup_key] = delta.to(torch.bfloat16)
++                touched_linears.add(lin)
++            else:
++                _, stack, eidx = target
++                expected = tuple(stack._e[eidx][2])
++                if tuple(delta.shape) != expected:
++                    print("[LingBot30B] LoRA shape mismatch on {}: delta {} vs {} - skipped".format(
++                        base, tuple(delta.shape), expected))
++                    skipped += 1
++                    continue
++                stack._rebels_lora_contribs.setdefault(eidx, {})[backup_key] = delta.to(torch.bfloat16)
++                touched_stacks.add(stack)
++            applied += 1
++        del sd
++
++    for lin in touched_linears:
++        object.__setattr__(lin, "_rebels_lora_delta", _recompute_lora_sum(lin._rebels_lora_contribs))
++    for stack in touched_stacks:
++        stack._rebels_lora_delta = {
++            eidx: total for eidx, contribs in stack._rebels_lora_contribs.items()
++            if (total := _recompute_lora_sum(contribs)) is not None
++        }
++
++    return applied, skipped
+ 
+ 
+ def _force_expert_for_loop():
+@@ -1022,6 +1371,7 @@ class LingBotMoELoaderGGUF:
+ NODE_CLASS_MAPPINGS = {
+     "LingBotTextEncode": LingBotTextEncode,
+     "LingBotLoader": LingBotLoader,
++    "LingBotLoraLoader": LingBotLoraLoader,
+     "LingBotSampler": LingBotSampler,
+     "LingBotStructuredPrompt": LingBotStructuredPrompt,
+     "LingBotMoELoaderGGUF": LingBotMoELoaderGGUF,
+@@ -1029,6 +1379,7 @@ NODE_CLASS_MAPPINGS = {
+ NODE_DISPLAY_NAME_MAPPINGS = {
+     "LingBotTextEncode": "LingBot Text Encode (lazy Qwen3-VL)",
+     "LingBotLoader": "LingBot Loader (1.3B dense)",
++    "LingBotLoraLoader": "LingBot LoRA Loader",
+     "LingBotSampler": "LingBot Sampler",
+     "LingBotStructuredPrompt": "LingBot Structured Prompt (JSON caption)",
+     "LingBotMoELoaderGGUF": "LingBot 30B MoE Loader (GGUF)",
