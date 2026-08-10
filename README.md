@@ -14,6 +14,9 @@ Two model families are supported:
 
 ## What's new in this fork: LoRA support
 
+<img width="900" height="291" alt="Captura de tela 2026-08-09 214527" src="https://github.com/user-attachments/assets/9e20e462-67b7-4097-bec3-24ea1a1ba0ec" />
+
+
 A new **LingBot LoRA Loader** node goes in between the loader and the sampler:
 
 ```
